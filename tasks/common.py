@@ -13,8 +13,6 @@ import urllib.request
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from filelock import FileLock
-
 from nanochat.common import get_base_dir
 
 
@@ -47,7 +45,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     Minimal stand-in for HuggingFace datasets.load_dataset(repo_id, subset, split=split).
     Every dataset on the hub has an auto-generated parquet export. We list the parquet
     shards via the hub API, download them (once) into the local cache directory, and
-    read them with pyarrow. Under torchrun, only one rank downloads, the others wait.
+    read them with pyarrow. The download is skipped when the manifest already exists.
     """
     base_dir = get_base_dir()
     slug = repo_id.replace("/", "--")
@@ -56,24 +54,20 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     manifest_path = os.path.join(shards_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         os.makedirs(shards_dir, exist_ok=True)
-        with FileLock(manifest_path + ".lock"):
-            # only a single rank acquires the lock and downloads, the others block
-            # here and then skip the download because they recheck the manifest
-            if not os.path.exists(manifest_path):
-                listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
-                with urllib.request.urlopen(listing_url) as response:
-                    shard_urls = json.loads(response.read())
-                filenames = []
-                for shard_index, shard_url in enumerate(shard_urls):
-                    filename = f"{shard_index:05d}.parquet"
-                    print(f"Downloading {shard_url} ...")
-                    with urllib.request.urlopen(shard_url) as response:
-                        content = response.read()
-                    with open(os.path.join(shards_dir, filename), "wb") as f:
-                        f.write(content)
-                    filenames.append(filename)
-                with open(manifest_path, "w") as f:
-                    json.dump(filenames, f)
+        listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
+        with urllib.request.urlopen(listing_url) as response:
+            shard_urls = json.loads(response.read())
+        filenames = []
+        for shard_index, shard_url in enumerate(shard_urls):
+            filename = f"{shard_index:05d}.parquet"
+            print(f"Downloading {shard_url} ...")
+            with urllib.request.urlopen(shard_url) as response:
+                content = response.read()
+            with open(os.path.join(shards_dir, filename), "wb") as f:
+                f.write(content)
+            filenames.append(filename)
+        with open(manifest_path, "w") as f:
+            json.dump(filenames, f)
     with open(manifest_path, "r") as f:
         filenames = json.load(f)
     shard_paths = [os.path.join(shards_dir, filename) for filename in filenames]

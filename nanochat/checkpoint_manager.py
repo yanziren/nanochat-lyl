@@ -16,8 +16,7 @@ from nanochat.common import setup_default_logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
 def log0(message):
-    if int(os.environ.get('RANK', 0)) == 0:
-        logger.info(message)
+    logger.info(message)
 
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
@@ -38,33 +37,40 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
-    if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
-        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
-        logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
+def _optimizer_path(checkpoint_dir, step):
+    """Prefer the single-file optimizer checkpoint, fall back to a rank-0 shard."""
+    path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
+    if os.path.exists(path):
+        return path
+    legacy = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank0.pt")
+    if os.path.exists(legacy):
+        return legacy
+    return path
+
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Save the model state parameters
+    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+    torch.save(model_data, model_path)
+    logger.info(f"Saved model parameters to: {model_path}")
+    # Save the metadata dict as json
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_data, f, indent=2)
+    logger.info(f"Saved metadata to: {meta_path}")
     if optimizer_data is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
-def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        optimizer_path = _optimizer_path(checkpoint_dir, step)
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -77,7 +83,7 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
-    - base model - uncompiled, not wrapped in DDP
+    - model
     - tokenizer
     - meta data saved during base model training
     """
@@ -170,8 +176,8 @@ def load_model(source, *args, **kwargs):
     checkpoints_dir = os.path.join(base_dir, model_dir)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
 
-def load_optimizer_state(source, device, rank, model_tag=None, step=None):
-    """Load just the optimizer shard for a given rank, without re-loading the model."""
+def load_optimizer_state(source, device, model_tag=None, step=None):
+    """Load the optimizer state without re-loading the model."""
     model_dir = {
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
@@ -184,7 +190,7 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
     if step is None:
         step = find_last_step(checkpoint_dir)
-    optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+    optimizer_path = _optimizer_path(checkpoint_dir, step)
     if not os.path.exists(optimizer_path):
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None

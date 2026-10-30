@@ -5,15 +5,13 @@ code lives in nanochat directory and is imported from here.
 
 Example runs:
 python -m scripts.chat_eval -i sft -a ARC-Easy
-torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 """
 
 import argparse
 from functools import partial
 import torch
-import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -27,14 +25,11 @@ from tasks.gsm8k import GSM8K
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    device = model.get_device()
-
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
     # Run the evaluation
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
+    for i in range(num_problems):
         conversation = task_object[i]
 
         # Tokenize the prompt
@@ -59,19 +54,10 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         num_passed += int(passed)
 
         # Logging (overwrite the same line in the console)
-        print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        print(f"\r\033[K{num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
 
     # Finish the in-place progress line with a newline before final summary
     print()
-
-    # Aggregate results across all ranks
-    if ddp:
-        num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
-        total_tensor = torch.tensor([total], dtype=torch.long, device=device)
-        dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        num_passed = num_passed_tensor.item()
-        total = total_tensor.item()
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
@@ -86,7 +72,6 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
     bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
 
@@ -98,7 +83,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_batches, ddp_world_size):
+    for i in range(num_batches):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
         # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
@@ -137,15 +122,6 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
             outcome = task_object.evaluate(conversation, predicted_letter)
             num_passed += int(outcome)
             total += 1
-
-    # Aggregate results across all ranks
-    if ddp:
-        num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
-        total_tensor = torch.tensor([total], dtype=torch.long, device=device)
-        dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        num_passed = num_passed_tensor.item()
-        total = total_tensor.item()
 
     average = num_passed/total
     print0(f"Final: {num_passed}/{total} ({100*average:.2f}%)")
@@ -193,7 +169,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
@@ -236,5 +212,3 @@ if __name__ == "__main__":
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
         print0(f"ChatCORE metric: {chatcore_metric:.4f}")
-
-    compute_cleanup()

@@ -1,44 +1,32 @@
 """
-Test the combined MuonAdamW optimizer (single rank, no process group).
+Test the combined MuonAdamW optimizer on CPU.
 The AdamW half is checked against torch.optim.AdamW as a reference;
 the Muon half is checked behaviorally (determinism + convergence).
-
-Requires a GPU (the fused kernels are compiled on first use, which
-dominates the runtime of this file).
 
 python -m pytest tests/test_optim.py -v
 """
 
-import pytest
 import torch
+from nanochat.optim import MuonAdamW
 
-cuda_available = torch.cuda.is_available()
-pytestmark = pytest.mark.skipif(not cuda_available, reason="optimizer tests require CUDA")
+DEVICE = "cpu"
 
-if cuda_available:
-    from nanochat.optim import MuonAdamW
-
-DEVICE = "cuda"
-
-# keep shapes small and reuse them across tests so the fused kernels compile once
-ADAMW_SMALL_SHAPE = (48,)        # numel < 1024 path
-ADAMW_LARGE_SHAPE = (1024, 4)    # numel >= 1024 path
+ADAMW_SHAPE = (64, 32)
 MUON_WIDE_SHAPE = (32, 64)
 MUON_TALL_SHAPE = (64, 32)
 
 
-def make_params_and_groups(seed=1337, offset=0.0, targets=None):
-    """The menagerie: small/large AdamW params, wide/tall Muon stacks."""
+def make_params_and_groups(seed=1337, offset=0.0):
+    """AdamW params plus wide and tall Muon stacks."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     def rand(shape):
         base = torch.randn(shape, generator=gen, device=DEVICE) * 0.05
         return torch.nn.Parameter(base + offset)
-    params = [rand(ADAMW_SMALL_SHAPE), rand(ADAMW_LARGE_SHAPE)]
+    params = [rand(ADAMW_SHAPE), rand(ADAMW_SHAPE)]
     params += [rand(MUON_WIDE_SHAPE) for _ in range(3)]
     params += [rand(MUON_TALL_SHAPE) for _ in range(2)]
     groups = [
-        dict(kind="adamw", params=params[0:1], lr=0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        dict(kind="adamw", params=params[1:2], lr=0.02, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.0),
+        dict(kind="adamw", params=params[0:2], lr=0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         dict(kind="muon", params=params[2:5], lr=0.02, momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=0.0),
         dict(kind="muon", params=params[5:7], lr=0.02, momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=0.0),
     ]
@@ -46,7 +34,7 @@ def make_params_and_groups(seed=1337, offset=0.0, targets=None):
 
 
 def test_adamw_matches_torch_reference():
-    """Our fused AdamW must agree with torch.optim.AdamW (both decoupled wd)."""
+    """Our AdamW step must agree with torch.optim.AdamW (both decoupled wd)."""
     hypers = dict(lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
     p_ours = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
     p_ref = torch.nn.Parameter(p_ours.detach().clone())

@@ -9,20 +9,14 @@ simpler and more similar to just REINFORCE:
 3) We use DAPO style normalization that is token-level, not sequence-level.
 4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
 
-1 GPU:
 python -m scripts.chat_rl
-
-8 GPUs:
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
 import argparse
 import os
 import itertools
-import wandb
 import torch
-import torch.distributed as dist
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, print0, get_base_dir, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -30,8 +24,6 @@ from tasks.gsm8k import GSM8K
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
-# Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
@@ -58,17 +50,11 @@ parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k 
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 args = parser.parse_args()
-user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
 # Init compute/precision
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+device = compute_init(device_type)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
@@ -85,8 +71,7 @@ print0(f"Calculated number of steps: {num_steps}")
 @torch.no_grad()
 def get_batch():
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
-    rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
-    for example_idx in itertools.cycle(rank_indices):
+    for example_idx in itertools.cycle(range(len(train_task))):
 
         # First get the full conversation of both user and assistant messages
         conversation = train_task[example_idx]
@@ -156,12 +141,10 @@ def run_gsm8k_eval(task, tokenizer, engine,
 ):
     """
     Evaluates GSM8K task and returns a list of records of evaluation outcomes.
-    In a distributed setting, all ranks cooperate but this function will NOT
-    do the reduction across ranks. This is the responsibility of the caller.
     Because the evaluation can take a while, this function will yield records one by one.
     """
     max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
-    for idx in range(ddp_rank, max_examples, ddp_world_size):
+    for idx in range(max_examples):
         conversation = task[idx]
         tokens = tokenizer.render_for_completion(conversation)
         prefix_length = len(tokens)
@@ -211,17 +194,15 @@ def get_lr_multiplier(it):
     lrm = 1.0 - it / num_steps
     return lrm
 
-# Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
-assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
-examples_per_rank = args.examples_per_step // ddp_world_size # per GPU
-print0(f"Calculated examples per rank: {examples_per_rank}")
+examples_per_step = args.examples_per_step
+print0(f"Examples per step: {examples_per_step}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
 for step in range(num_steps):
 
-    # Evaluate the model once in a while and log to wandb
+    # Evaluate the model once in a while
     if step % args.eval_every == 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
@@ -229,23 +210,15 @@ for step in range(num_steps):
         records = list(records_iter) # collect all records
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
-        num_records = torch.tensor(len(records), dtype=torch.long, device=device)
-        if ddp:
-            dist.all_reduce(num_records, op=dist.ReduceOp.SUM)
-            dist.all_reduce(passk, op=dist.ReduceOp.SUM)
-        passk = passk / num_records.item() # normalize by the total number of records
+        num_records = len(records)
+        passk = passk / num_records # normalize by the total number of records
         print_passk = [f"Pass@{k}: {passk[k - 1].item():.4f}" for k in range(1, args.device_batch_size + 1)]
         print0(f"Step {step} | {', '.join(print_passk)}")
-        log_passk = {f"pass@{k}": passk[k - 1].item() for k in range(1, args.device_batch_size + 1)}
-        wandb_run.log({
-            "step": step,
-            **log_passk,
-        })
 
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
-    for example_step in range(examples_per_rank):
+    for example_step in range(examples_per_step):
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
         # Evaluate the loss and gradients
@@ -264,9 +237,9 @@ for step in range(num_steps):
             logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
-            # normalize by the number of valid tokens, number of passes, and examples_per_rank
+            # normalize by the number of valid tokens, number of passes, and examples per step
             num_valid = (targets >= 0).sum().clamp(min=1)
-            pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+            pg_obj = pg_obj / (num_valid * num_passes * examples_per_step)
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
@@ -279,19 +252,7 @@ for step in range(num_steps):
     # A bunch of logging for how the rollouts went this step
     mean_reward = sum(rewards_list) / len(rewards_list)
     mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
-    if ddp: # aggregate across ranks
-        mean_reward_tensor = torch.tensor(mean_reward, dtype=torch.float, device=device)
-        mean_sequence_length_tensor = torch.tensor(mean_sequence_length, dtype=torch.float, device=device)
-        dist.all_reduce(mean_reward_tensor, op=dist.ReduceOp.AVG)
-        dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
-        mean_reward = mean_reward_tensor.item()
-        mean_sequence_length = mean_sequence_length_tensor.item()
     print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
-    wandb_run.log({
-        "step": step,
-        "reward": mean_reward,
-        "sequence_length": mean_sequence_length,
-    })
 
     # Update the model parameters
     lrm = get_lr_multiplier(step)
@@ -299,13 +260,10 @@ for step in range(num_steps):
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
     model.zero_grad(set_to_none=True)
-    wandb_run.log({
-        "step": step,
-        "lrm": lrm,
-    })
+    print0(f"Step {step}/{num_steps} | lrm: {lrm:.4f}")
 
-    # Master process saves the model once in a while. Skip first step. Save last step.
-    if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
+    # Save the model once in a while. Skip first step. Save last step.
+    if (step > 0 and step % args.save_every == 0) or step == num_steps - 1:
         base_dir = get_base_dir()
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
@@ -320,7 +278,4 @@ for step in range(num_steps):
                 "model_config": model_config_kwargs,
             }
         )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
-
-wandb_run.finish() # wandb run finish
-compute_cleanup()
+        print(f"Saved model checkpoint to {checkpoint_dir}")

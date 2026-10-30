@@ -17,9 +17,6 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
 uv sync --extra cpu
 source .venv/bin/activate
-if [ -z "$WANDB_RUN" ]; then
-    WANDB_RUN=dummy
-fi
 
 # train tokenizer on ~2B characters (~34 seconds on my MacBook Pro M3 Max)
 python -m nanochat.dataset -n 8
@@ -40,16 +37,14 @@ python -m scripts.base_train \
     --eval-tokens=524288 \
     --core-metric-every=-1 \
     --sample-every=100 \
-    --num-iterations=5000 \
-    --run=$WANDB_RUN
+    --num-iterations=5000
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 
 # SFT (~10 minutes on my MacBook Pro M3 Max)
 python -m scripts.chat_sft \
     --eval-every=200 \
     --eval-tokens=524288 \
-    --num-iterations=1500 \
-    --run=$WANDB_RUN
+    --num-iterations=1500
 
 # Chat with the model over CLI
 # The model should be able to say that it is Paris.

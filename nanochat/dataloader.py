@@ -1,5 +1,5 @@
 """
-Distributed dataloaders for pretraining.
+Dataloaders for pretraining.
 
 BOS-aligned bestfit:
    - Every row starts with BOS token
@@ -19,20 +19,17 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 import torch
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
+    Handles approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
     """
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
+    warn_on_legacy = split == "train"
     parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
@@ -49,23 +46,21 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
-            # Start from resume point if resuming on same file, otherwise from DDP rank
+            # Start just after the resume point so we don't repeat data
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                base_idx = resume_rg_idx // ddp_world_size
-                base_idx += 1  # advance by 1 so we don't repeat data after resuming
-                rg_idx = base_idx * ddp_world_size + ddp_rank
+                rg_idx = resume_rg_idx + 1
                 if rg_idx >= pf.num_row_groups:
                     pq_idx += 1
                     continue
                 resume_rg_idx = None  # only do this once
             else:
-                rg_idx = ddp_rank
+                rg_idx = 0
             while rg_idx < pf.num_row_groups:
                 rg = pf.read_row_group(rg_idx)
                 batch = rg.column('text').to_pylist()
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
+                rg_idx += 1
             pq_idx += 1
         first_pass = False
         epoch += 1

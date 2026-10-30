@@ -81,11 +81,10 @@ def use_calculator(expr):
 # -----------------------------------------------------------------------------
 class KVCache:
     """
-    KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
+    KV cache for inference.
 
-    Key differences from FA2-style cache:
-    - Tensors are (B, T, H, D) not (B, H, T, D)
-    - FA3 updates the cache in-place during flash_attn_with_kvcache
+    - Tensors are (B, T, H, D)
+    - Attention writes new keys and values into the cache in place
     - Position tracked per batch element via cache_seqlens tensor
     """
 
@@ -307,7 +306,7 @@ if __name__ == "__main__":
     import time
     # init compute
     device_type = autodetect_device_type()
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    device = compute_init(device_type)
     # load the model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval")
     bos_token_id = tokenizer.get_bos_token_id()

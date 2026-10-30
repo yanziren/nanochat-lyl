@@ -10,10 +10,6 @@ Default is all three: --eval core,bpb,sample
 
 Examples:
 
-    # Evaluate a nanochat model (e.g. d24) using 8 GPUs
-    torchrun --nproc_per_node=8 -m scripts.base_eval --model-tag d24 --device-batch-size=16
-
-    # Quick/approximate evaluation using a single GPU
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 """
 import os
@@ -28,7 +24,7 @@ import tempfile
 import argparse
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanochat.common import compute_init, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -145,7 +141,7 @@ def main():
 
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    device = compute_init(device_type)
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]
@@ -167,41 +163,40 @@ def main():
         print0("\n" + "="*80)
         print0("Model Samples")
         print0("="*80)
-        if ddp_rank == 0:
-            prompts = [
-                "The capital of France is",
-                "The chemical symbol of gold is",
-                "If yesterday was Friday, then tomorrow will be",
-                "The opposite of hot is",
-                "The planets of the solar system are:",
-                "My favorite color is",
-                "If 5*x + 3 = 13, then x is",
-            ]
-            engine = Engine(model, tokenizer)
-            print0("\nConditioned samples:")
-            for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                sample_str = tokenizer.decode(sample[0])
-                print0("-" * 80)
-                print0(sample_str)
-                samples.append(sample_str)
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        engine = Engine(model, tokenizer)
+        print0("\nConditioned samples:")
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            sample_str = tokenizer.decode(sample[0])
+            print0("-" * 80)
+            print0(sample_str)
+            samples.append(sample_str)
 
-            print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
-            uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
-            for sample in uncond:
-                sample_str = tokenizer.decode(sample)
-                print0("-" * 80)
-                print0(sample_str)
-                unconditioned_samples.append(sample_str)
+        print0("\nUnconditioned samples:")
+        tokens = tokenizer("", prepend="<|bos|>")
+        uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
+        for sample in uncond:
+            sample_str = tokenizer.decode(sample)
+            print0("-" * 80)
+            print0(sample_str)
+            unconditioned_samples.append(sample_str)
 
     # --- BPB evaluation ---
     if 'bpb' in eval_modes:
         print0("\n" + "="*80)
         print0("BPB Evaluation")
         print0("="*80)
-        tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
+        tokens_per_step = args.device_batch_size * sequence_len
         if args.split_tokens % tokens_per_step != 0:
             # Adjust to nearest multiple
             args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
@@ -222,21 +217,18 @@ def main():
         core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
 
         # Write CSV output
-        if ddp_rank == 0:
-            base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
-            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-            with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
-                for label in core_results["results"]:
-                    acc = core_results["results"][label]
-                    centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
-            print0(f"\nResults written to: {output_csv_path}")
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
-
-    compute_cleanup()
+        base_dir = get_base_dir()
+        output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+        with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+            for label in core_results["results"]:
+                acc = core_results["results"][label]
+                centered = core_results["centered_results"][label]
+                f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
+            f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
+        print0(f"\nResults written to: {output_csv_path}")
+        print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
 
 if __name__ == "__main__":
